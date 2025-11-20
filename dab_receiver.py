@@ -15,6 +15,14 @@ import threading
 import time
 from collections import deque
 
+# Import FIC decoder for service scanning
+try:
+    from dab_fic_decoder import ServiceScanner
+    FIC_AVAILABLE = True
+except ImportError:
+    FIC_AVAILABLE = False
+    print("Warning: dab_fic_decoder not available, service scanning disabled")
+
 # ==================== DAB MODE I PARAMETER ====================
 class DABParams:
     """DAB Transmission Mode I Parameter"""
@@ -336,6 +344,9 @@ class DABReceiver:
         self.sample_buffer = np.array([], dtype=np.complex128)
         self.min_buffer_size = self.params.T_F * 1.5  # 1.5 frames worth für schnellere Verarbeitung
 
+        # FIC callback (for service scanning)
+        self.fic_callback = None
+
     def add_samples(self, samples):
         """Add new IQ samples to buffer"""
         self.sample_buffer = np.concatenate([self.sample_buffer, samples])
@@ -379,6 +390,7 @@ class DABReceiver:
 
         # Process data blocks (1-75)
         all_constellation = []
+        fic_soft_bits = []  # For FIC blocks (1, 2, 3)
         pos = self.params.T_u
 
         # Process first few blocks for constellation diagram (nur 4 für Performance)
@@ -393,11 +405,19 @@ class DABReceiver:
             if constellation is not None:
                 all_constellation.append(constellation)
 
+            # Collect FIC blocks (1, 2, 3) for service scanning
+            if block_num <= 3 and soft_bits is not None:
+                fic_soft_bits.append((block_num, soft_bits))
+
         # Combine constellation points
         if all_constellation:
             all_constellation = np.concatenate(all_constellation)
         else:
             all_constellation = None
+
+        # Call FIC callback if registered
+        if self.fic_callback and len(fic_soft_bits) >= 3:
+            self.fic_callback(fic_soft_bits)
 
         # Remove processed samples (aggressiver cleanup für Performance)
         self.sample_buffer = self.sample_buffer[frame_start + self.params.T_s * 4:]
@@ -439,8 +459,18 @@ class DABReceiverGUI:
         self.raw_samples = np.zeros(4096, dtype=np.complex128)
         self.raw_samples_lock = threading.Lock()
 
+        # Service Scanner (FIC decoder)
+        self.service_scanner = ServiceScanner() if FIC_AVAILABLE else None
+        self.scanning_enabled = False
+        self.scan_frames = 0
+        self.max_scan_frames = 50  # Scan for 50 frames (~5 seconds)
+
         self.setup_gui()
         self.init_rtlsdr()
+
+        # Register FIC callback
+        if self.service_scanner:
+            self.receiver.fic_callback = self.process_fic_blocks
 
     def setup_gui(self):
         """Setup GUI elements"""
@@ -473,6 +503,33 @@ class DABReceiverGUI:
         self.frame_label = ttk.Label(ctrl_frame, text="Frames: 0",
                                      font=('Arial', 10))
         self.frame_label.pack(pady=5)
+
+        # Service Scanner
+        if FIC_AVAILABLE:
+            ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=10)
+            ttk.Label(ctrl_frame, text="Service Scanner", font=('Arial', 11, 'bold')).pack(pady=5)
+
+            self.scan_button = ttk.Button(ctrl_frame, text="Scan for Services",
+                                         command=self.start_scan)
+            self.scan_button.pack(pady=5)
+
+            self.scan_status = ttk.Label(ctrl_frame, text="Ready", font=('Arial', 9))
+            self.scan_status.pack(pady=2)
+
+            # Service List
+            list_frame = ttk.Frame(ctrl_frame)
+            list_frame.pack(pady=5, fill=tk.BOTH, expand=True)
+
+            ttk.Label(list_frame, text="Services:", font=('Arial', 9, 'bold')).pack()
+
+            scroll = ttk.Scrollbar(list_frame)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+            self.service_listbox = tk.Listbox(list_frame, height=10, width=30,
+                                              yscrollcommand=scroll.set,
+                                              font=('Courier', 8))
+            self.service_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scroll.config(command=self.service_listbox.yview)
 
         # DAB Channel buttons
         ttk.Label(ctrl_frame, text="DAB Kanäle", font=('Arial', 11, 'bold')).pack(pady=10)
@@ -662,9 +719,96 @@ class DABReceiverGUI:
         # Schedule next update
         self.root.after(200, self.update_plots)
 
+    def start_scan(self):
+        """Start scanning for services"""
+        if not self.service_scanner:
+            return
+
+        # Reset scanner
+        self.service_scanner.reset()
+        self.scanning_enabled = True
+        self.scan_frames = 0
+
+        # Clear service list
+        self.service_listbox.delete(0, tk.END)
+        self.service_listbox.insert(tk.END, "Scanning...")
+
+        self.scan_button.config(state='disabled')
+        self.scan_status.config(text="Scanning... 0/50", foreground='blue')
+
+    def process_fic_blocks(self, fic_soft_bits):
+        """Process FIC blocks (callback from DABReceiver)"""
+        if not self.scanning_enabled or not self.service_scanner:
+            return
+
+        # Extract soft bits for blocks 1, 2, 3
+        if len(fic_soft_bits) < 3:
+            return
+
+        try:
+            block1_bits = fic_soft_bits[0][1]
+            block2_bits = fic_soft_bits[1][1]
+            block3_bits = fic_soft_bits[2][1]
+
+            # Process FIC blocks
+            self.service_scanner.process_fic_blocks(block1_bits, block2_bits, block3_bits)
+
+            self.scan_frames += 1
+            self.scan_status.config(text=f"Scanning... {self.scan_frames}/{self.max_scan_frames}")
+
+            # Stop after max frames
+            if self.scan_frames >= self.max_scan_frames:
+                self.scanning_enabled = False
+                self.finish_scan()
+
+        except Exception as e:
+            print(f"FIC processing error: {e}")
+
+    def finish_scan(self):
+        """Finish scanning and display results"""
+        if not self.service_scanner:
+            return
+
+        results = self.service_scanner.get_results()
+
+        # Update service list
+        self.service_listbox.delete(0, tk.END)
+
+        # Ensemble info
+        ensemble_name = results.get('ensemble_name', 'Unknown')
+        ensemble_id = results.get('ensemble_id', 0)
+        self.service_listbox.insert(tk.END, f"=== {ensemble_name} ===")
+        self.service_listbox.insert(tk.END, f"EId: {ensemble_id:04X}")
+        self.service_listbox.insert(tk.END, "")
+
+        # Services
+        services = results.get('services', [])
+        if services:
+            for svc in services:
+                name = svc.get('name', 'Unknown')
+                sid = svc.get('sid', 0)
+                self.service_listbox.insert(tk.END, f"{name} (SId: {sid:04X})")
+        else:
+            self.service_listbox.insert(tk.END, "No services found")
+            self.service_listbox.insert(tk.END, "")
+            self.service_listbox.insert(tk.END, "Try:")
+            self.service_listbox.insert(tk.END, "- Better antenna")
+            self.service_listbox.insert(tk.END, "- Different channel")
+            self.service_listbox.insert(tk.END, "- Wait for more frames")
+
+        # Status
+        fibs_valid = results.get('fibs_valid', 0)
+        self.scan_status.config(
+            text=f"Done! {len(services)} services, {fibs_valid} FIBs",
+            foreground='green'
+        )
+
+        self.scan_button.config(state='normal')
+
     def cleanup(self):
         """Cleanup on exit"""
         self.is_running = False
+        self.scanning_enabled = False
         time.sleep(0.3)
         if self.sdr:
             self.sdr.close()
