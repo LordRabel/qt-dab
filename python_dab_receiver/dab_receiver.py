@@ -25,13 +25,44 @@ class RTLSDRHandler:
         Args:
             device_index: RTL-SDR device index (default: 0)
         """
+        # First, try to import the module
         try:
             from rtlsdr import RtlSdr
+        except ImportError as e:
+            raise ImportError(
+                f"pyrtlsdr package not found: {e}\n"
+                f"Install with: pip install pyrtlsdr"
+            )
+
+        # Then, try to initialize the device
+        try:
             self.sdr = RtlSdr(device_index)
-        except ImportError:
-            raise ImportError("pyrtlsdr not installed. Install with: pip install pyrtlsdr")
+        except (OSError, IOError) as e:
+            # Device not found or access denied
+            raise RuntimeError(
+                f"Failed to open RTL-SDR device:\n{e}\n\n"
+                f"Troubleshooting:\n"
+                f"  • Is RTL-SDR dongle connected?\n"
+                f"  • On Windows: Install librtlsdr.dll (see Zadig driver installation)\n"
+                f"  • On Linux: Check USB permissions (udev rules)\n"
+                f"  • Try different USB port\n"
+                f"  • Check if another program is using the device"
+            )
+        except ImportError as e:
+            # librtlsdr library not found (common on Windows)
+            raise RuntimeError(
+                f"RTL-SDR library (librtlsdr) not found:\n{e}\n\n"
+                f"Windows Installation:\n"
+                f"  1. Download Zadig: https://zadig.akeo.ie/\n"
+                f"  2. Run Zadig, select your RTL-SDR device\n"
+                f"  3. Install WinUSB driver (not libusb-win32!)\n"
+                f"  4. Download librtlsdr.dll:\n"
+                f"     https://ftp.osmocom.org/binaries/windows/rtl-sdr/\n"
+                f"  5. Place librtlsdr.dll in Python directory or PATH\n\n"
+                f"Alternative: Use SDR# to verify device works first"
+            )
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize RTL-SDR: {e}")
+            raise RuntimeError(f"Unexpected error initializing RTL-SDR: {e}")
 
         # DAB Mode I Parameters (same as qt-dab)
         self.SAMPLERATE = 2048000  # 2.048 MHz

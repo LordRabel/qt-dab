@@ -44,6 +44,16 @@ cd python_dab_receiver
 pip install -r requirements.txt
 ```
 
+**⚠️ WINDOWS BENUTZER:** Nach der Installation von `pyrtlsdr` müssen Sie noch zusätzliche Schritte durchführen!
+
+➡️ **Siehe [WINDOWS_INSTALL.md](WINDOWS_INSTALL.md) für vollständige Windows-Installationsanleitung**
+
+Kurz:
+1. Zadig installieren und WinUSB-Treiber für RTL-SDR installieren
+2. librtlsdr.dll herunterladen und ins Python-Verzeichnis kopieren
+
+**Test:** Führen Sie `python test_rtlsdr.py` aus, um Ihre Installation zu überprüfen!
+
 ### 2. RTL-SDR Treiber (Linux)
 
 ```bash
