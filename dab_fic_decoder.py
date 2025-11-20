@@ -45,11 +45,18 @@ def crc16_check(bits):
     if len(bits) != 256:
         return False
 
+    # Validate: all values must be 0 or 1
+    if not np.all((bits == 0) | (bits == 1)):
+        return False
+
+    # Ensure uint8 dtype for packbits
+    bits = bits.astype(np.uint8)
+
     # Generator polynomial (MSB first)
     # x^16 + x^12 + x^5 + 1 = 0x1021
     poly = 0x1021
 
-    # Convert bits to bytes - FIX: proper byte conversion
+    # Convert bits to bytes - ensure safe conversion
     data = np.packbits(bits[:240])  # 30 bytes data
     crc_bits = np.packbits(bits[240:256])  # 2 bytes CRC
 
@@ -124,7 +131,7 @@ class SimplifiedViterbiDecoder:
             output_length: Number of output bits (768 for FIC)
 
         Returns:
-            Decoded hard bits (0/1)
+            Decoded hard bits (0/1) as uint8 array
         """
         # This is a PLACEHOLDER implementation
         # Real Viterbi would use:
@@ -144,9 +151,9 @@ class SimplifiedViterbiDecoder:
             if idx + self.rate <= len(soft_bits):
                 symbols = soft_bits[idx:idx + self.rate]
                 # Hard decision: 128 = threshold
-                hard_symbols = (symbols > 128).astype(int)
-                # Majority vote
-                output_bits[i] = 1 if np.sum(hard_symbols) >= 2 else 0
+                hard_symbols = (symbols > 128).astype(np.uint8)
+                # Majority vote - ensure result is 0 or 1
+                output_bits[i] = np.uint8(1) if np.sum(hard_symbols) >= 2 else np.uint8(0)
 
         return output_bits
 
@@ -267,14 +274,18 @@ class FICHandler:
         hard_bits = self.viterbi.decode(mapped, 768)
 
         # 4. Energy dispersal (XOR with PRBS)
-        hard_bits ^= PRBS
+        # Ensure result is strictly 0 or 1
+        hard_bits = (hard_bits ^ PRBS) & 1
+        hard_bits = hard_bits.astype(np.uint8)
 
         # 5. Split into 3 FIBs and check CRC
         valid_fibs = []
         for i in range(3):
             fib = hard_bits[i * FIB_SIZE:(i + 1) * FIB_SIZE]
-            if crc16_check(fib):
-                valid_fibs.append(fib)
+            # Ensure FIB contains only 0 or 1 before CRC check
+            if np.all((fib == 0) | (fib == 1)):
+                if crc16_check(fib):
+                    valid_fibs.append(fib)
 
         return valid_fibs
 
