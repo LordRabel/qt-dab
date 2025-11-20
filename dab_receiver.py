@@ -168,47 +168,51 @@ class TimeSynchronizer:
 
     def find_null_symbol(self, samples, signal_level):
         """
-        Findet NULL Symbol in IQ samples
+        Findet NULL Symbol in IQ samples (optimierte vektorisierte Version)
         Returns: Index des ersten Samples nach NULL period
         """
-        env_buffer = deque(maxlen=self.C_LEVEL_SIZE)
-        c_level = 0
+        if len(samples) < self.T_F:
+            return -1
 
-        # Initialize buffer
-        for i in range(min(self.C_LEVEL_SIZE, len(samples))):
-            level = np.abs(samples[i])
-            env_buffer.append(level)
-            c_level += level
+        # Vektorisiert: Magnitude berechnen
+        magnitudes = np.abs(samples)
+
+        # Downsampling für schnellere Suche (jeden 4. Sample)
+        step = 4
+        search_magnitudes = magnitudes[::step]
+
+        # Moving average mit Convolution (schneller als Loop)
+        window = np.ones(self.C_LEVEL_SIZE // step) / (self.C_LEVEL_SIZE // step)
+        if len(search_magnitudes) < len(window):
+            return -1
+
+        avg_levels = np.convolve(search_magnitudes, window, mode='valid')
 
         # Find NULL period (energy dip)
-        pos = self.C_LEVEL_SIZE
-        counter = 0
-        while pos < len(samples) and counter < self.T_F:
-            avg_level = c_level / self.C_LEVEL_SIZE
-            if avg_level < self.threshold_low * signal_level:
-                break
+        null_threshold = self.threshold_low * signal_level
+        rise_threshold = self.threshold_high * signal_level
 
-            level = np.abs(samples[pos])
-            c_level = c_level - env_buffer[0] + level
-            env_buffer.append(level)
-            pos += 1
-            counter += 1
+        # Suche NULL start
+        null_start_candidates = np.where(avg_levels < null_threshold)[0]
+        if len(null_start_candidates) == 0:
+            return -1
 
-        if counter >= self.T_F:
-            return -1  # No NULL found
+        null_start_idx = null_start_candidates[0] * step
 
-        # Find end of NULL period (energy rise)
-        counter = 0
-        while pos < len(samples) and counter < self.T_null + 50:
-            avg_level = c_level / self.C_LEVEL_SIZE
-            if avg_level > self.threshold_high * signal_level:
+        # Suche NULL end (ab null_start)
+        search_start = null_start_idx + self.C_LEVEL_SIZE
+        if search_start >= len(magnitudes):
+            return -1
+
+        search_end = min(search_start + self.T_null + 500, len(magnitudes) - self.C_LEVEL_SIZE)
+        if search_end <= search_start:
+            return -1
+
+        # Moving average für Ende
+        for pos in range(search_start, search_end, step):
+            avg_level = np.mean(magnitudes[pos:pos + self.C_LEVEL_SIZE])
+            if avg_level > rise_threshold:
                 return pos
-
-            level = np.abs(samples[pos])
-            c_level = c_level - env_buffer[0] + level
-            env_buffer.append(level)
-            pos += 1
-            counter += 1
 
         return -1  # No end of NULL found
 
@@ -330,15 +334,16 @@ class DABReceiver:
 
         # Buffer for IQ samples
         self.sample_buffer = np.array([], dtype=np.complex128)
-        self.min_buffer_size = self.params.T_F * 2  # 2 frames worth
+        self.min_buffer_size = self.params.T_F * 1.5  # 1.5 frames worth für schnellere Verarbeitung
 
     def add_samples(self, samples):
         """Add new IQ samples to buffer"""
         self.sample_buffer = np.concatenate([self.sample_buffer, samples])
 
-        # Keep buffer size manageable
-        if len(self.sample_buffer) > self.min_buffer_size * 3:
-            self.sample_buffer = self.sample_buffer[-self.min_buffer_size:]
+        # Keep buffer size manageable (aggressiver für Performance)
+        max_buffer = int(self.min_buffer_size * 2)
+        if len(self.sample_buffer) > max_buffer:
+            self.sample_buffer = self.sample_buffer[-max_buffer:]
 
     def process_frame(self):
         """
@@ -376,8 +381,8 @@ class DABReceiver:
         all_constellation = []
         pos = self.params.T_u
 
-        # Process first few blocks for constellation diagram
-        for block_num in range(1, min(10, self.params.L)):  # Process first 9 blocks
+        # Process first few blocks for constellation diagram (nur 4 für Performance)
+        for block_num in range(1, min(5, self.params.L)):  # Process first 4 blocks
             if pos + self.params.T_s > len(frame_data):
                 break
 
@@ -394,8 +399,8 @@ class DABReceiver:
         else:
             all_constellation = None
 
-        # Remove processed samples
-        self.sample_buffer = self.sample_buffer[frame_start + self.params.T_s * 10:]
+        # Remove processed samples (aggressiver cleanup für Performance)
+        self.sample_buffer = self.sample_buffer[frame_start + self.params.T_s * 4:]
 
         self.is_synced = True
         self.frame_count += 1
@@ -429,6 +434,10 @@ class DABReceiverGUI:
             '11C': 220.352e6, '11D': 222.064e6, '12A': 223.936e6, '12B': 225.648e6,
             '12C': 227.360e6, '12D': 229.072e6,
         }
+
+        # Raw samples für Spektrum
+        self.raw_samples = np.zeros(4096, dtype=np.complex128)
+        self.raw_samples_lock = threading.Lock()
 
         self.setup_gui()
         self.init_rtlsdr()
@@ -570,7 +579,7 @@ class DABReceiverGUI:
 
     def receive_and_process(self):
         """Receive and process samples (separate thread)"""
-        buffer_size = 32768
+        buffer_size = 65536  # Größerer Buffer für besseren Durchsatz
 
         while self.is_running:
             try:
@@ -578,6 +587,10 @@ class DABReceiverGUI:
                     # Read samples
                     samples = self.sdr.read_samples(buffer_size)
                     samples = samples.astype(np.complex128)
+
+                    # Speichere letzte Samples für Spektrum
+                    with self.raw_samples_lock:
+                        self.raw_samples = samples[:4096].copy()
 
                     # Add to receiver buffer
                     self.receiver.add_samples(samples)
@@ -589,7 +602,7 @@ class DABReceiverGUI:
                         self.update_constellation(constellation)
                         self.update_status()
 
-                time.sleep(0.01)
+                time.sleep(0.001)  # Minimal sleep für besseren Durchsatz
             except Exception as e:
                 print(f"Receive error: {e}")
                 time.sleep(0.1)
@@ -619,10 +632,31 @@ class DABReceiverGUI:
         if not self.is_running:
             return
 
-        # Redraw canvas
+        # Update Spektrum
         try:
+            with self.raw_samples_lock:
+                samples = self.raw_samples.copy()
+
+            if len(samples) > 0:
+                # FFT für Spektrum
+                window = np.hanning(len(samples))
+                windowed = samples * window
+                fft_data = np.fft.fftshift(np.fft.fft(windowed))
+                power = np.abs(fft_data) ** 2
+                power_db = 10 * np.log10(power + 1e-12)
+
+                # Frequenz-Achse
+                freqs = np.fft.fftshift(np.fft.fftfreq(len(samples), 1/2.048e6))
+                freq_mhz = self.freq_var.get() + freqs / 1e6
+
+                # Update Spektrum-Plot
+                self.line_spec.set_data(freq_mhz, power_db)
+                self.ax_spec.relim()
+                self.ax_spec.autoscale_view()
+
+            # Redraw canvas
             self.canvas.draw_idle()
-        except:
+        except Exception as e:
             pass
 
         # Schedule next update
