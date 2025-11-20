@@ -49,14 +49,21 @@ def crc16_check(bits):
     # x^16 + x^12 + x^5 + 1 = 0x1021
     poly = 0x1021
 
-    # Convert bits to bytes
+    # Convert bits to bytes - FIX: proper byte conversion
     data = np.packbits(bits[:240])  # 30 bytes data
-    crc_received = int(np.packbits(bits[240:256])[0]) << 8 | int(np.packbits(bits[240:256])[1])
+    crc_bits = np.packbits(bits[240:256])  # 2 bytes CRC
+
+    # Extract CRC value safely - FIX: use int() conversion properly
+    if len(crc_bits) >= 2:
+        crc_received = (int(crc_bits[0]) << 8) | int(crc_bits[1])
+    else:
+        return False
 
     # Calculate CRC
     crc = 0xFFFF
-    for byte in data:
-        crc ^= (byte << 8)
+    for byte_val in data:
+        byte_val = int(byte_val)  # FIX: ensure int conversion
+        crc ^= (byte_val << 8)
         for _ in range(8):
             if crc & 0x8000:
                 crc = (crc << 1) ^ poly

@@ -176,7 +176,7 @@ class TimeSynchronizer:
 
     def find_null_symbol(self, samples, signal_level):
         """
-        Findet NULL Symbol in IQ samples (optimierte vektorisierte Version)
+        Findet NULL Symbol in IQ samples (robuste vektorisierte Version)
         Returns: Index des ersten Samples nach NULL period
         """
         if len(samples) < self.T_F:
@@ -190,39 +190,48 @@ class TimeSynchronizer:
         search_magnitudes = magnitudes[::step]
 
         # Moving average mit Convolution (schneller als Loop)
-        window = np.ones(self.C_LEVEL_SIZE // step) / (self.C_LEVEL_SIZE // step)
+        window_size = max(4, self.C_LEVEL_SIZE // step)
+        window = np.ones(window_size) / window_size
         if len(search_magnitudes) < len(window):
             return -1
 
         avg_levels = np.convolve(search_magnitudes, window, mode='valid')
 
-        # Find NULL period (energy dip)
+        # Find NULL period (energy dip) - robustere Schwellwerte
         null_threshold = self.threshold_low * signal_level
         rise_threshold = self.threshold_high * signal_level
 
-        # Suche NULL start
+        # Suche mehrere NULL-Kandidaten
         null_start_candidates = np.where(avg_levels < null_threshold)[0]
         if len(null_start_candidates) == 0:
             return -1
 
-        null_start_idx = null_start_candidates[0] * step
+        # Teste mehrere Kandidaten (ersten 3)
+        for candidate_idx in null_start_candidates[:3]:
+            null_start_idx = candidate_idx * step
 
-        # Suche NULL end (ab null_start)
-        search_start = null_start_idx + self.C_LEVEL_SIZE
-        if search_start >= len(magnitudes):
-            return -1
+            # Suche NULL end (ab null_start)
+            search_start = null_start_idx + window_size * step
+            if search_start >= len(magnitudes):
+                continue
 
-        search_end = min(search_start + self.T_null + 500, len(magnitudes) - self.C_LEVEL_SIZE)
-        if search_end <= search_start:
-            return -1
+            search_end = min(search_start + self.T_null + 1000, len(magnitudes) - self.C_LEVEL_SIZE)
+            if search_end <= search_start:
+                continue
 
-        # Moving average für Ende
-        for pos in range(search_start, search_end, step):
-            avg_level = np.mean(magnitudes[pos:pos + self.C_LEVEL_SIZE])
-            if avg_level > rise_threshold:
-                return pos
+            # Suche Anstieg nach NULL
+            for pos in range(search_start, search_end, step):
+                if pos + self.C_LEVEL_SIZE > len(magnitudes):
+                    break
 
-        return -1  # No end of NULL found
+                avg_level = np.mean(magnitudes[pos:pos + self.C_LEVEL_SIZE])
+                if avg_level > rise_threshold:
+                    # Validiere: NULL-Region sollte wirklich schwach sein
+                    null_region_level = np.mean(magnitudes[null_start_idx:pos])
+                    if null_region_level < 0.6 * signal_level:
+                        return pos
+
+        return -1  # No valid NULL found
 
 # ==================== OFDM DECODER ====================
 class OFDMDecoder:
@@ -347,6 +356,11 @@ class DABReceiver:
         # FIC callback (for service scanning)
         self.fic_callback = None
 
+        # Frame tracking for better sync
+        self.last_null_pos = -1
+        self.sync_confidence = 0
+        self.consecutive_good_frames = 0
+
     def add_samples(self, samples):
         """Add new IQ samples to buffer"""
         self.sample_buffer = np.concatenate([self.sample_buffer, samples])
@@ -358,7 +372,7 @@ class DABReceiver:
 
     def process_frame(self):
         """
-        Verarbeitet einen DAB Frame
+        Verarbeitet einen DAB Frame mit Frame-Tracking
         Returns: (success, constellation_points)
         """
         if len(self.sample_buffer) < self.params.T_F:
@@ -367,13 +381,42 @@ class DABReceiver:
         # Calculate signal level (for NULL detection)
         signal_level = np.mean(np.abs(self.sample_buffer[:10000]))
 
-        # Find NULL symbol
-        null_pos = self.time_sync.find_null_symbol(self.sample_buffer, signal_level)
+        # Try predictive sync if we have good confidence
+        null_pos = -1
+        if self.sync_confidence > 3 and self.last_null_pos > 0:
+            # Predict next NULL position (T_F samples after last)
+            predicted_pos = self.last_null_pos
 
+            # Check around predicted position (±500 samples tolerance)
+            search_start = max(0, predicted_pos - 500)
+            search_end = min(len(self.sample_buffer), predicted_pos + 500)
+
+            if search_end - search_start >= self.params.T_null:
+                # Verify NULL at predicted position
+                null_region = self.sample_buffer[search_start:search_end]
+                avg_level = np.mean(np.abs(null_region[:self.params.T_null]))
+
+                # If signal is low at predicted position, use it
+                if avg_level < 0.6 * signal_level:
+                    null_pos = predicted_pos
+                    self.sync_confidence = min(10, self.sync_confidence + 1)
+                else:
+                    # Prediction failed, do full search
+                    self.sync_confidence = max(0, self.sync_confidence - 2)
+
+        # Full NULL symbol search if prediction failed
         if null_pos < 0:
-            # No sync, remove some samples and retry
-            self.sample_buffer = self.sample_buffer[5000:]
-            return False, None
+            null_pos = self.time_sync.find_null_symbol(self.sample_buffer, signal_level)
+
+            if null_pos < 0:
+                # No sync, remove some samples and retry
+                self.sample_buffer = self.sample_buffer[5000:]
+                self.sync_confidence = 0
+                self.consecutive_good_frames = 0
+                return False, None
+
+            # Found via search, reset confidence
+            self.sync_confidence = 1
 
         # Check if we have enough samples after NULL
         if null_pos + self.params.T_F - self.params.T_null > len(self.sample_buffer):
@@ -419,10 +462,26 @@ class DABReceiver:
         if self.fic_callback and len(fic_soft_bits) >= 3:
             self.fic_callback(fic_soft_bits)
 
+        # Check constellation quality for sync confidence
+        if all_constellation is not None and len(all_constellation) > 100:
+            # Good constellation has points away from origin
+            avg_magnitude = np.mean(np.abs(all_constellation))
+            if avg_magnitude > 0.3:  # Good signal
+                self.consecutive_good_frames += 1
+                self.sync_confidence = min(10, self.sync_confidence + 1)
+            else:  # Weak signal (noise around origin)
+                self.consecutive_good_frames = 0
+                self.sync_confidence = max(0, self.sync_confidence - 1)
+
+        # Update last NULL position for next frame prediction
+        # Next NULL will be at: current_position + T_F
+        self.last_null_pos = self.params.T_F
+
         # Remove processed samples (aggressiver cleanup für Performance)
         self.sample_buffer = self.sample_buffer[frame_start + self.params.T_s * 4:]
 
-        self.is_synced = True
+        # Update sync status
+        self.is_synced = self.consecutive_good_frames >= 2
         self.frame_count += 1
 
         return True, all_constellation
@@ -503,6 +562,10 @@ class DABReceiverGUI:
         self.frame_label = ttk.Label(ctrl_frame, text="Frames: 0",
                                      font=('Arial', 10))
         self.frame_label.pack(pady=5)
+
+        self.confidence_label = ttk.Label(ctrl_frame, text="Confidence: 0/10",
+                                         font=('Arial', 9), foreground='gray')
+        self.confidence_label.pack(pady=2)
 
         # Service Scanner
         if FIC_AVAILABLE:
@@ -683,6 +746,14 @@ class DABReceiverGUI:
             self.sync_label.config(text="Sync: NO", foreground='red')
 
         self.frame_label.config(text=f"Frames: {self.receiver.frame_count}")
+
+        # Update confidence indicator
+        conf = self.receiver.sync_confidence
+        conf_color = 'green' if conf >= 7 else ('orange' if conf >= 4 else 'red')
+        self.confidence_label.config(
+            text=f"Confidence: {conf}/10 ({'●' * conf}{'○' * (10-conf)})",
+            foreground=conf_color
+        )
 
     def update_plots(self):
         """Update plots periodically"""
