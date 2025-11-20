@@ -22,11 +22,20 @@ Dies ist eine Python-Implementierung eines DAB (Digital Audio Broadcasting) Empf
 - Phase Reference basierte Dekodierung
 - QPSK Konstellationsdiagramm
 
+✅ **FIC Decoding & Service Scanner** 🆕
+- Viterbi Decoder (K=7, Rate 1/4)
+- Depuncturing (PI_16/PI_15/PI_X patterns)
+- Energy Dispersal (PRBS)
+- CRC-16 Check
+- FIG Parser (0/0, 0/1, 0/2, 1/0, 1/1)
+- **Findet Sender im Kanal** (z.B. Deutschlandfunk, WDR, etc.)
+
 ✅ **Visualisierung**
 - Live Konstellationsdiagramm (I/Q Plot)
 - Spektrum-Anzeige
 - Sync-Status
 - Frame-Counter
+- **Service-Liste mit Sender-Namen** 🆕
 
 ## Architektur
 
@@ -85,6 +94,34 @@ Die GUI zeigt:
 - Frequenz-Regler (links)
 - DAB Kanal-Buttons (5C - 12D)
 - Status-Informationen (Sync, Frame Count)
+- **Service Scanner** (neu): "Scan for Services" Button 🆕
+
+### Service Scanner benutzen
+
+1. **Kanal wählen**: Klicke auf DAB-Kanal-Button (z.B. "8B")
+2. **Warten auf Sync**: Status zeigt "Sync: YES" (grün)
+3. **Scan starten**: Klicke "Scan for Services"
+4. **Warten**: Scanner läuft ~5 Sekunden (50 Frames)
+5. **Ergebnisse**: Service-Liste zeigt:
+   - Ensemble-Name (z.B. "WDR Muenster")
+   - Ensemble-ID (z.B. "d31d")
+   - Sender-Namen (z.B. "Deutschlandfunk", "WDR 2", "1LIVE")
+   - Service-IDs (SId)
+
+**Beispiel Output (Kanal 8B):**
+```
+=== WDR Muenster ===
+EId: D31D
+
+Deutschlandfunk (SId: D312)
+WDR 2 Rheinland (SId: D314)
+1LIVE (SId: D315)
+WDR 3 (SId: D316)
+WDR 4 (SId: D317)
+WDR 5 (SId: D318)
+KIRAKA (SId: D319)
+...
+```
 
 ### Integration mit bestehendem Scanner
 
@@ -244,33 +281,84 @@ Das Konstellationsdiagramm zeigt die QPSK-Symbole:
   - DC-Offset-Korrektur einbauen
   - Fine Frequency Correction implementieren
 
+## FIC Decoding Details 🆕
+
+Der Service Scanner dekodiert FIC (Fast Information Channel) um Sender zu finden:
+
+### Pipeline
+
+```
+FIC Blocks 1, 2, 3 (je 3072 soft bits)
+  ↓
+[Depuncturing] → PI_16/PI_15/PI_X patterns → 3096 bits
+  ↓
+[Viterbi K=7] → Convolutional decode, rate 1/4 → 768 hard bits
+  ↓
+[Energy Dispersal] → XOR mit PRBS (x^9 + x^5 + 1)
+  ↓
+[Split to FIBs] → 3 FIBs à 256 bits (30 bytes data + 2 bytes CRC)
+  ↓
+[CRC-16 Check] → Nur valide FIBs weiter
+  ↓
+[FIG Parser] → Extract service info:
+  - FIG 0/0: Ensemble ID
+  - FIG 0/1: Subchannel organization
+  - FIG 0/2: Service organization (SId → subchannel)
+  - FIG 1/0: Ensemble label (name)
+  - FIG 1/1: Service labels (station names)
+  ↓
+[Service List] → Anzeige in GUI
+```
+
+### Viterbi Decoder Hinweis
+
+**WICHTIG**: Die aktuelle Implementation ist **vereinfacht**:
+- Hard Decision (Majority Vote)
+- **Keine** ACS (Add-Compare-Select) Operations
+- **Kein** optimaler Traceback
+- Funktioniert für **Demonstration**, aber nicht optimal
+
+**Für bessere Ergebnisse** (bei schwachen Signalen):
+- Nutze optimierte Viterbi-Library (z.B. `libfec` via Python bindings)
+- Mit Soft-Decision ACS und Traceback
+- SIMD-Optimierung
+
+### FIG Types
+
+| FIG | Ext | Beschreibung | Inhalt |
+|-----|-----|--------------|--------|
+| 0/0 | 0 | Ensemble Info | Ensemble ID, CIF counter |
+| 0/1 | 1 | Sub-channel Org | Start address, size, bitrate |
+| 0/2 | 2 | Service Org | SId → subchannel mapping |
+| 1/0 | 0 | Ensemble Label | Ensemble name (16 chars) |
+| 1/1 | 1 | Service Label | Station name (16 chars) |
+
 ## Nächste Schritte / Erweiterungen
 
-Dieser Empfänger dekodiert bis zum Konstellationsdiagramm. Für vollständigen DAB-Empfang:
+✅ **Bereits implementiert:**
+- OFDM Demodulation bis Konstellationsdiagramm
+- **FIC Decoder für Service-Scanning** 🆕
+- **Service-Liste mit Sender-Namen** 🆕
+
+⏳ **Für vollständigen DAB-Empfang (mit Audio) fehlt noch:**
 
 1. **Frequency Synchronization** (Coarse + Fine)
    - Cyclic Prefix Correlation
    - Carrier Offset Estimation
 
-2. **FIC Decoder** (Blocks 1-3)
-   - Viterbi Decoder (Convolutional Code)
-   - CRC Check
-   - Service Information (Ensemble, Services)
-
-3. **MSC Decoder** (Blocks 4-75)
+2. **MSC Decoder** (Blocks 4-75)
    - Time/Frequency Interleaving
    - Viterbi Decoder
    - Energy Dispersal
    - Reed-Solomon Decoder
 
-4. **Audio Decoder**
+3. **Audio Decoder**
    - MPEG-1 Layer 2 (MP2)
    - DAB+ (HE-AAC v2)
 
-5. **SNR Berechnung**
+4. **SNR Berechnung**
    - Cyclic Prefix Correlation Level
    - NULL Period Level
-   - `SNR = 20 × log10(prefix_level / null_level)`
 
 ## Referenzen
 
@@ -288,6 +376,7 @@ Python-Port erstellt basierend auf qt-dab C++ Code.
 
 ---
 
-**Status**: ✅ Funktional bis Konstellationsdiagramm
-**Getestet mit**: RTL-SDR V4, DAB Band III (Deutschland)
+**Status**: ✅ Funktional bis Service-Scanning (FIC Decoder)
+**Features**: Konstellationsdiagramm + Spektrum + **Sender-Liste** 🆕
+**Getestet mit**: RTL-SDR V4, DAB Band III (Deutschland), Kanal 8B
 **Python Version**: 3.8+
