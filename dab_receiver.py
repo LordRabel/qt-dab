@@ -23,6 +23,119 @@ except ImportError:
     FIC_AVAILABLE = False
     print("Warning: dab_fic_decoder not available, service scanning disabled")
 
+# ==================== AGC (AUTOMATIC GAIN CONTROL) ====================
+class AutomaticGainControl:
+    """
+    Automatic Gain Control für RTL-SDR
+    Passt Gain automatisch an Signalstärke an
+    """
+    def __init__(self, sdr, target_level=0.3, min_gain=0, max_gain=49.6):
+        self.sdr = sdr
+        self.target_level = target_level  # Ziel-Signal-Level (0.0-1.0)
+        self.min_gain = min_gain
+        self.max_gain = max_gain
+        self.current_gain = 28.0  # Start-Gain
+
+        # AGC parameters
+        self.level_history = deque(maxlen=10)  # Letzte 10 Messungen
+        self.update_interval = 20  # Update alle N Frames
+        self.update_counter = 0
+        self.enabled = False
+
+        # Thresholds
+        self.overload_threshold = 0.95  # Signal zu stark
+        self.weak_threshold = 0.05      # Signal zu schwach
+        self.adjustment_step = 3.0       # Gain-Änderung pro Update (dB)
+
+    def update(self, signal_level):
+        """
+        Update AGC basierend auf Signal-Level
+
+        Args:
+            signal_level: Normalisiertes Signal-Level (0.0-1.0)
+        """
+        if not self.enabled:
+            return
+
+        self.level_history.append(signal_level)
+        self.update_counter += 1
+
+        # Update nur alle N Frames (nicht zu häufig)
+        if self.update_counter < self.update_interval:
+            return
+
+        self.update_counter = 0
+
+        # Durchschnittliches Signal-Level
+        if len(self.level_history) < 3:
+            return
+
+        avg_level = np.mean(list(self.level_history))
+
+        # Entscheide ob Gain angepasst werden muss
+        new_gain = self.current_gain
+
+        if avg_level > self.overload_threshold:
+            # Signal zu stark → Gain reduzieren
+            new_gain = max(self.min_gain, self.current_gain - self.adjustment_step)
+            reason = "overload"
+        elif avg_level < self.weak_threshold:
+            # Signal zu schwach → Gain erhöhen
+            new_gain = min(self.max_gain, self.current_gain + self.adjustment_step)
+            reason = "weak"
+        elif avg_level > self.target_level * 1.3:
+            # Etwas zu stark → sanfte Reduktion
+            new_gain = max(self.min_gain, self.current_gain - self.adjustment_step / 2)
+            reason = "reduce"
+        elif avg_level < self.target_level * 0.7:
+            # Etwas zu schwach → sanfte Erhöhung
+            new_gain = min(self.max_gain, self.current_gain + self.adjustment_step / 2)
+            reason = "increase"
+        else:
+            # Signal im guten Bereich
+            return
+
+        # Gain setzen wenn Änderung nötig
+        if abs(new_gain - self.current_gain) > 0.5:
+            self._set_gain(new_gain)
+            print(f"AGC: {reason} - Level: {avg_level:.2f} → Gain: {self.current_gain:.1f} dB")
+
+    def _set_gain(self, gain_db):
+        """Set RTL-SDR gain"""
+        try:
+            # RTL-SDR unterstützt diskrete Gain-Werte
+            # Runde auf nächsten unterstützten Wert
+            self.sdr.gain = gain_db
+            self.current_gain = gain_db
+            time.sleep(0.05)  # Kurze Pause nach Gain-Änderung
+        except Exception as e:
+            print(f"AGC: Could not set gain: {e}")
+
+    def set_manual_gain(self, gain_db):
+        """Manuelles Setzen des Gains (deaktiviert AGC temporär)"""
+        self.enabled = False
+        self._set_gain(gain_db)
+
+    def enable(self, enabled=True):
+        """AGC aktivieren/deaktivieren"""
+        self.enabled = enabled
+        if enabled:
+            self.level_history.clear()
+            self.update_counter = 0
+            print(f"AGC: Enabled (target: {self.target_level:.2f})")
+        else:
+            print("AGC: Disabled")
+
+    def get_status(self):
+        """Get current AGC status"""
+        avg_level = np.mean(list(self.level_history)) if self.level_history else 0.0
+        return {
+            'enabled': self.enabled,
+            'current_gain': self.current_gain,
+            'signal_level': avg_level,
+            'target_level': self.target_level
+        }
+
 # ==================== DAB MODE I PARAMETER ====================
 class DABParams:
     """DAB Transmission Mode I Parameter"""
@@ -524,12 +637,21 @@ class DABReceiverGUI:
         self.scan_frames = 0
         self.max_scan_frames = 50  # Scan for 50 frames (~5 seconds)
 
+        # AGC
+        self.agc = None
+        self.agc_enabled = False
+
         self.setup_gui()
         self.init_rtlsdr()
 
         # Register FIC callback
         if self.service_scanner:
             self.receiver.fic_callback = self.process_fic_blocks
+
+        # Initialize AGC after SDR is ready
+        if self.sdr:
+            self.agc = AutomaticGainControl(self.sdr, target_level=0.3)
+            self.agc.enable(False)  # Start disabled
 
     def setup_gui(self):
         """Setup GUI elements"""
@@ -549,6 +671,37 @@ class DABReceiverGUI:
 
         self.freq_label = ttk.Label(ctrl_frame, text="197.648 MHz", font=('Arial', 12))
         self.freq_label.pack(pady=5)
+
+        # AGC Control
+        ttk.Separator(ctrl_frame, orient='horizontal').pack(fill='x', pady=5)
+        ttk.Label(ctrl_frame, text="Gain Control", font=('Arial', 11, 'bold')).pack(pady=5)
+
+        # AGC Toggle
+        self.agc_var = tk.BooleanVar(value=False)
+        agc_check = ttk.Checkbutton(ctrl_frame, text="Auto Gain (AGC)",
+                                     variable=self.agc_var,
+                                     command=self.toggle_agc)
+        agc_check.pack()
+
+        # Manual Gain Slider
+        gain_frame = ttk.Frame(ctrl_frame)
+        gain_frame.pack(pady=2)
+
+        ttk.Label(gain_frame, text="Manual:", font=('Arial', 9)).pack(side=tk.LEFT)
+        self.gain_var = tk.DoubleVar(value=28.0)
+        self.gain_slider = ttk.Scale(gain_frame, from_=0, to=49.6,
+                                     variable=self.gain_var,
+                                     command=self.change_gain,
+                                     orient=tk.HORIZONTAL, length=120)
+        self.gain_slider.pack(side=tk.LEFT, padx=5)
+
+        self.gain_label = ttk.Label(ctrl_frame, text="Gain: 28.0 dB",
+                                    font=('Arial', 9))
+        self.gain_label.pack()
+
+        self.signal_label = ttk.Label(ctrl_frame, text="Signal: --",
+                                      font=('Arial', 9), foreground='gray')
+        self.signal_label.pack(pady=2)
 
         # Status
         self.status_label = ttk.Label(ctrl_frame, text="Status: Starting...",
@@ -688,6 +841,41 @@ class DABReceiverGUI:
             self.sdr.center_freq = freq_hz
             time.sleep(0.05)
 
+    def toggle_agc(self):
+        """Toggle AGC on/off"""
+        if not self.agc:
+            return
+
+        self.agc_enabled = self.agc_var.get()
+
+        if self.agc_enabled:
+            # Enable AGC
+            self.agc.enable(True)
+            self.gain_slider.config(state='disabled')
+            self.gain_label.config(foreground='gray')
+            print("AGC: Enabled")
+        else:
+            # Disable AGC, use manual gain
+            self.agc.enable(False)
+            self.gain_slider.config(state='normal')
+            self.gain_label.config(foreground='black')
+            # Set current slider value
+            gain_val = self.gain_var.get()
+            if self.sdr:
+                self.agc.set_manual_gain(gain_val)
+            print(f"AGC: Disabled, manual gain: {gain_val:.1f} dB")
+
+    def change_gain(self, val=None):
+        """Change manual gain"""
+        if self.agc_enabled:
+            return  # Ignore if AGC is active
+
+        gain_val = float(self.gain_var.get())
+        self.gain_label.config(text=f"Gain: {gain_val:.1f} dB")
+
+        if self.sdr and self.agc:
+            self.agc.set_manual_gain(gain_val)
+
     def set_channel(self, channel):
         """Set DAB channel"""
         freq_hz = self.dab_channels[channel]
@@ -711,6 +899,14 @@ class DABReceiverGUI:
                     # Speichere letzte Samples für Spektrum
                     with self.raw_samples_lock:
                         self.raw_samples = samples[:4096].copy()
+
+                    # Update AGC with signal level
+                    if self.agc:
+                        signal_level = np.mean(np.abs(samples))
+                        max_level = np.max(np.abs(samples))
+                        # Normalize to 0.0-1.0 range (assuming max IQ value ~1.0)
+                        normalized_level = min(1.0, max_level)
+                        self.agc.update(normalized_level)
 
                     # Add to receiver buffer
                     self.receiver.add_samples(samples)
@@ -754,6 +950,25 @@ class DABReceiverGUI:
             text=f"Confidence: {conf}/10 ({'●' * conf}{'○' * (10-conf)})",
             foreground=conf_color
         )
+
+        # Update AGC status
+        if self.agc:
+            status = self.agc.get_status()
+            if self.agc_enabled:
+                # AGC active - show current gain
+                self.gain_label.config(text=f"Gain: {status['current_gain']:.1f} dB (Auto)")
+            else:
+                # Manual mode
+                self.gain_label.config(text=f"Gain: {status['current_gain']:.1f} dB")
+
+            # Signal level display
+            sig_level = status['signal_level']
+            sig_percent = int(sig_level * 100)
+            sig_color = 'green' if 0.2 < sig_level < 0.8 else ('orange' if 0.05 < sig_level else 'red')
+            self.signal_label.config(
+                text=f"Signal: {sig_percent}% {'█' * min(10, int(sig_level * 10))}",
+                foreground=sig_color
+            )
 
     def update_plots(self):
         """Update plots periodically"""
